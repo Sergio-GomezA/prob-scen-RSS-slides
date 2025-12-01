@@ -1,0 +1,623 @@
+---
+title: "Probabilistic Wind Power Forecasting"
+author:
+  - "S. Gomez$^1$"
+  - A. Lenzi$^1$
+  - C. Dent$^1$
+institute:
+   - $^1$School of Mathematics, University of Edinburgh
+institute-short: "UoE"
+date: "2025-09-02"
+format: 
+  beamer:
+    theme: Rochester
+    colortheme: spruce
+    fonttheme: professionalfonts
+    fig-cap-location: top
+    toc: true
+    split-bib: true
+    output-file: "Tuesday-PM-Sergio-Gomez-Anaya.pdf"
+fontsize: 12pt
+aspectratio: 169
+editor: source
+bibliography: refs.bib
+nocite: "@*"
+---
+
+```{r globalopt, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, cache = FALSE)
+# knitr::opts_knit$set(root.dir = "../../p2_replication")
+```
+
+
+```{r include=FALSE}
+require(tidyverse)
+require(parallel)
+require(ggsci)
+require(readxl)
+require(data.table)
+require(lubridate)
+require(kableExtra)
+require(INLA)
+
+```
+
+
+```{r}
+mc <- detectCores()-2
+# list.files("~/OneDrive")
+source("kablefunction.R")
+# source("functions_probscen.R")
+# source("../forecasting/fcst_functions.R")
+# setwd("../../p2_replication")
+source("aux_funct.R")
+
+```
+```{r}
+# setwd("../../p2_replication")
+data.scaled <- fread("aggr_powr_bpa_12-23.csv.gz") %>% 
+  mutate(
+    time = as.POSIXct(time, tz = "PST"),
+    date = as.Date(date))
+
+scaling_params  <- read.csv("aggr_powr_bpa_scaling_pars.csv")
+```
+
+
+
+# Wind energy resource assessment {#sec-intro}
+
+## Wind energy integration
+
+Climate change requires us to integrate renewable sources to the energy system.
+Wind energy can account for up to 68.3% of total generation in the UK.
+
+-   Supply cannot be controlled
+-   We want to predict wind energy and quantify its uncertainty
+-   Use this information to meet energy demand optimally
+
+## Objective
+
+\begin{block}{Objective}
+Generate renewable energy predictions along with their associated uncertainty for regions of interest in the short term.
+In addition to the point estimate, we aim to produce energy scenarios whose behaviour closely resembles observed data.
+\end{block}
+
+
+## Behaviour
+\small
+Let $P(s)_{t}$ denote the normalised wind energy output at point $s$ and time $t$.
+
+- Leverage spatio-temporal properties
+  $$\operatorname{Cov}(P(a)_{t},P(b)_{t})$$
+  $$\operatorname{Cov}{(P(s)_{t},P(s)_{t+h})} $$
+- Smoothness and variability
+$$\Delta P(s)_{t}  = P(s)_{t+1}-P(s)_{t}\ , \quad \operatorname{Var} (P(s)_{t})$$
+- Physical constraints: installed capacity  
+$$0<P(s)_{t}< P(s)^{\max}_{t}$$
+
+# Data sources {#sec-data}
+
+## Data
+
+Mix of spatio-temporal data sources:
+
+-   Gridded weather data: wind speed $w(s)_t$
+-   Historical generation and forecast $\tilde p_t, \tilde f_t$ in MW
+-   Wind farm capacity $c_t$
+-   Normalised wind power  $p_t = \tilde p_t / c_t$
+
+<!-- ## Boneville Power Administration US -->
+
+<!-- \begin{figure} -->
+<!--     \centering -->
+<!--     \includegraphics[width=0.8\textwidth]{~/ownCloud-s2441782@datasync.ed.ac.uk/projects/proj2/p2_replication/extra_fig/us_power_administration.png} -->
+<!--     \caption{US power admin. coverage} -->
+<!-- \end{figure} -->
+## Bonneville Power Administration US
+
+![US power administration coverage](extra_fig/us_power_administration.png){width=60% .no-margin}
+
+
+## Gridded data and wind farms locations
+```{r fig.width=5, fig.height=2, fig.cap="Locations of the 21 wind farms"}
+require(rnaturalearth)
+require(rnaturalearthdata)
+require(ggthemes)
+require(ggspatial)
+# setwd("../../p2_replication")
+
+plants.bpa.loc <- read.csv("plants_bpa_loc.csv")
+merra.grid <- read.csv("merra_grid.csv")
+# with map
+# Load the world and U.S. states data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+us_states <- ne_states(country = "United States of America", returnclass = "sf")
+my_palette <- pal_locuszoom()(3)
+library(scales)
+# show_col(my_palette[-1])
+# Your plot
+plants.bpa.loc %>% 
+  ggplot() +
+  # Add the base map
+  geom_sf(data = world, fill = "gray95", color = "gray80") +
+  # Add U.S. state boundaries
+  geom_sf(data = us_states, fill = NA, color = "black") +
+  # Add your data
+  geom_point(aes(xlong, ylat, col = "Wind farms", size = t_cap)) +
+  geom_point(aes(lon, lat, col = "MERRA-2 grid"), data = merra.grid, size = 0.7) +
+  scale_size_continuous(range = c(1, 3))+  # Adjust range to make points smaller
+  # Add state names
+  geom_text(
+    data = us_states, 
+    aes(x = longitude, y = latitude, label = name),
+    size = 4, color = "black"
+  ) +
+  # geom_point(aes(lon, lat, col = "closest points"), data = merra.grid.close) +
+  coord_sf(xlim = c(-125, -115), ylim = c(43, 48), expand = FALSE) +
+  theme_map() +
+  theme(
+    legend.position = "right",
+    # legend.box = "vertical"
+    legend.text = element_text(size = 10),    # Increase legend text size
+    legend.title = element_text(size = 10)   # Increase legend title size
+  ) +
+  annotation_scale(
+    location = "bl",  # Bottom-left corner
+    width_hint = 0.2,  # Adjust width of scale bar
+    bar_cols = c("black", "white"), # Color of scale bar
+    line_width = 0.5
+  ) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  labs(col = "", size = "Capacity in MW") +
+  # scale_color_locuszoom() +
+  scale_color_manual(values = my_palette[-1])+
+  guides(
+    col = guide_legend(ncol = 1),
+    size = guide_legend(ncol = 1)
+  )
+# fig_path_new <- "~/ownCloud-s2441782@datasync.ed.ac.uk/projects/proj2/prob-scenarios-main-doc/fig"
+  
+# ggsave(
+#   file.path(fig_path_new, "wind_farms_location_map.png"), width = 7, height = 5
+# )
+```
+
+## Wind power time series
+
+<!-- ```{r, fig.cap="Wind energy and forecast", fig.width=4, fig.height=2} -->
+<!-- t0 <- "2013-11-02" %>% as.POSIXct(tz="PST") -->
+<!-- plot_nh <- plot_nh_ahead( -->
+<!--     data.scaled,                         -->
+<!--     mycols = c("actuals.cf", "forecast.cf_orig"),  -->
+<!--     t0,                           -->
+<!--     h = 24, -->
+<!--     show.fig = FALSE, -->
+<!--     legend.position = "inside", -->
+<!--     position = c(0.7,0.3), -->
+<!--     ylim = c(0,1) -->
+<!--     ) -->
+<!-- plot_nh$plot+ -->
+<!--   scale_x_datetime(date_labels = "%H:%M") -->
+
+<!-- ``` -->
+
+```{r}
+make_subfigure_block_plots <- function(days, data, titles,
+                                       mycols = c("actuals.cf", "forecast.cf_orig"),
+                                       h = 24, plot_type = "forecast") {
+  outfiles <- character(length(days))
+  
+  for (i in seq_along(days)) {
+    t0 <- as.POSIXct(days[i], tz = "PST")
+    if (i<=1) pos <- c(0.3,0.6) else pos <- c(0.5,0.3)
+    # print(pos)
+    p <- plot_nh_ahead(
+      data.scaled,
+      mycols = mycols,
+      t0,
+      h = h,
+      show.fig = FALSE,
+      legend.position = "inside",
+      position = pos,
+      ylim = c(0,1)
+    )$plot +
+      scale_x_datetime(date_labels = "%H:%M")
+    
+    # save each plot
+    outfile <- paste0("plot_", format(t0, "%Y-%m-%d"), "_", plot_type, ".png")
+    ggsave(outfile, p, width = 4, height = 3, dpi = 150)
+    outfiles[i] <- outfile
+  }
+  
+  # Build LaTeX subfigure block
+  subfigs <- mapply(function(file, title) {
+    paste0(
+      "\\begin{subfigure}{0.32\\textwidth}\n",
+      "  \\includegraphics[width=\\linewidth]{", file, "}\n",
+      "  \\caption{", title, "}\n",
+      "\\end{subfigure}"
+    )
+  }, outfiles, titles, SIMPLIFY = FALSE)
+  
+  paste0(
+    "\\begin{figure}[ht]\n",
+    "  \\centering\n",
+    paste(unlist(subfigs), collapse = "\n"),
+    "\n  \\caption{24h forecasts for three days.}\n",
+    "\\end{figure}\n"
+  )
+}
+
+```
+
+```{r, results='asis'}
+days <- c("2013-08-29", "2013-10-13", "2013-11-02")
+titles <- c("2013-08-29", "2013-10-13", "2013-11-02")
+
+cat(make_subfigure_block_plots(days, data.scaled, titles))
+```
+
+<!-- ## Figure A -->
+<!-- :::{.columns} -->
+
+<!-- ::::{.column width="50%"} -->
+<!-- - Leverage spatio-temporal properties   -->
+<!-- - Smoothness and variability   -->
+<!-- - Physical constraints: installed capacity   -->
+<!-- :::: -->
+
+<!-- ::::{.column width="50%"} -->
+<!-- ```{r, fig.cap="Wind energy and forecast", fig.width=5, fig.height=3.5} -->
+<!-- t0 <- "2013-06-20" %>% as.POSIXct(tz="PST") -->
+<!-- plot_nh <- plot_nh_ahead( -->
+<!--     data.scaled,                         -->
+<!--     mycols = c("actuals", "forecast"),  -->
+<!--     t0,                           -->
+<!--     h = 24, -->
+<!--     show.fig = FALSE, -->
+<!--     legend.position = "inside", -->
+<!--     position = c(0.3,0.3), -->
+<!--     ylim = c(0,5000) -->
+<!--     ) -->
+<!-- plot_nh$plot -->
+
+<!-- ``` -->
+<!-- :::: -->
+<!-- ::: -->
+
+## Objective
+
+\begin{block}{Project goal}
+Leverage historical point forecasts and additional data sources to produce probabilistic forecasting. 
+\end{block}
+
+-   Uncertainty quantification (UQ) around wind power point forecasts.
+-   Integrate extra information: weather, time, constraints, etc.
+-   Obtain short-term probabilistic scenarios
+-   Match behaviour of the wind energy process
+
+
+
+# Model framework {#sec-model}
+
+## Model framework
+
+- Bayesian modelling estimated using Integrated Nested Laplace Approximation (INLA)
+- Beta distribution: wind power $P_t\in (0,1)$
+- Power ramp effect
+- Autoregressive components: AR(p)
+- Nonlinear effects
+- Regime switching
+
+## Hierarchical Bayesian Model
+
+:::{.columns}
+
+::::{.column width="60%"}
+\small
+Normalised Power with Beta likelihood model (NPB): 
+\begin{equation}
+\resizebox{\linewidth}{!}{$
+\begin{aligned}
+P_t & \sim \text{Beta}\left(\mu_t \phi,\ \phi(1-\mu_t)\right), \\%F(s), \quad F \in \{\text{Gaussian, Gamma, Beta}\} \\
+E[P_t|\mathbf{x}_t] &= \mu_t = g^{-1}(\eta_t  + \beta \Delta \eta_t), \\
+    \eta_t &=  \alpha + s_f(f_t)  + s_w(w_t) + s_m(m_t) + s_h(h_t) + u_t, \\% + \text{month} + \text{hour}, \\
+    u_t &= \rho_1 u_{t-1} + \rho_2 u_{t-2} + \epsilon_t, \quad \epsilon_t \sim N(0,\tau_u^{-1}), 
+\end{aligned}
+$}
+\label{eq:power_model}
+\end{equation}
+
+where $g$ is the logit function, $\Delta^2 s_k \sim  N(0, \tau_k)$, i.e. a random walk of order 2.
+::::
+
+::::{.column width="40%"}
+
+\begin{equation*}
+  \scalebox{0.75}{$
+    \begin{aligned}
+        P_t &: \text{Normalised power at } t\\
+        \mu_t &: \text{expected wind power}\\
+        \phi &: \text{dispersion}\\
+        \eta_t &: \text{linear predictor}\\
+        \beta &: \text{power ramp sens.}\\
+        w_t &: \text{wind speed}\\
+        f_t &: \text{day-ahead power forecast}\\
+        \alpha &: \text{Intercept}\\
+        s_f &: \text{forecast regime correction}\\
+        s_w &: \text{wind regime correction}\\
+        s_m, s_h &: \text{month, hour effects}\\
+        u_t &: \text{autocorrelation term}
+    \end{aligned}
+    $}
+    \label{eq:parameters}
+\end{equation*}
+::::
+:::
+
+
+# Results {#sec-results}
+
+## Posterior samples
+```{r}
+mod.file.name <- "2501_us_power_ar2_v7.rds"
+# read model
+mod.path <- file.path("model_objects",mod.file.name)
+mod.temp <- readRDS(mod.path)
+
+# # summary
+# # summary(mod.temp)
+# # plots
+# # source("aux_funct.R")
+# set.seed(0)
+# t1 <- "2013-06-20 00:00:00 PST" %>% as.POSIXct(tz = "PST")
+# # all.visualistions(
+# #   mod.temp,t1,data.scaled,n.sim.plot = c(5,20),
+# #   effects = FALSE, hyper = FALSE
+# #   )
+# 
+# # getwd()
+# stored_samples <- read.csv("samples_fix_ar2_v7.csv")
+# samples_fixed <- simulation.plots.inla2(
+#   inla.model = mod.temp, 
+#   data = data.scaled,
+#   response = mod.temp$.args$formula[[2]] %>% as.character(),
+#   t1 = t1,
+#   quSeq = c(0.025,0.5,0.975),
+#   family = mod.temp$.args$family,
+#   resp.lab = "Wind Power",
+#   nsamp = 1000,
+#   show.fig = FALSE,
+#   sample.df = stored_samples,
+#   n.sim.plot = c(5,20),
+#   ylim = c(0,1)
+#   )
+# write.csv(samples_fixed$samples, "../../p2_replication/samples_fix_ar2_v7.csv", row.names = FALSE)
+```
+
+<!-- ```{r} -->
+<!-- # library(magick) -->
+<!-- # library(gridExtra) -->
+
+<!-- library(png) -->
+<!-- library(grid) -->
+<!-- library(gridExtra) -->
+<!-- folders <- c( -->
+<!--   "~/Documents/proj2/samples2/fd2/1_betnpow/fig",  -->
+<!--   "~/Documents/proj2/samples2/eta/1_betnpoweta/fig",  -->
+<!--   "~/Documents/proj2/samples2/regime/1_betnpow/fig") -->
+
+<!-- # plot_day <- "2013-08-02" # worse daCy -->
+<!-- # plot_day <- "2013-09-13" # bad day -->
+<!-- # plot_day <- "2013-10-30" # bad day -->
+<!-- # plot_day <- "2013-08-23" # good day -->
+<!-- plot_day <- "2013-11-02" # best day -->
+<!-- # plot_day <- "2013-11-15" # good day -->
+<!-- # plot_day <- "2013-12-23" # good day -->
+<!-- plot_types <- c("sim.small","sim.large","quantiles") -->
+<!-- titles  <- c("Base", "PR", "RS-PR")  -->
+
+<!-- grobs <- mapply(function(f, title) { -->
+<!--   files <- list.files(f, pattern = paste0("_t", plot_day, "_", plot_types[2]), full.names = TRUE) -->
+<!--   if (length(files) == 0) return(nullGrob()) -->
+
+<!--   img <- readPNG(files[1]) -->
+<!--   img_grob <- rasterGrob(img, interpolate = TRUE) -->
+
+<!--   # Put title on top of image using arrangeGrob -->
+<!--   arrangeGrob( -->
+<!--     textGrob(title, gp = gpar(fontsize = 14, fontface = "bold")), -->
+<!--     img_grob, -->
+<!--     ncol = 1, -->
+<!--     heights = c(1, 10)  # adjust ratio of title vs image space -->
+<!--   ) -->
+<!-- }, folders, titles, SIMPLIFY = FALSE) -->
+
+
+<!-- ``` -->
+
+<!-- ```{r fig.cap="Posterior samples", fig.width=4.5, fig.height=2} -->
+<!-- # simulations -->
+<!-- # samples_fixed$p.sim.small+ -->
+<!-- #   theme(legend.position.inside = c(.15,.3)) -->
+<!-- grid.arrange(grobs = grobs, ncol = length(grobs)) -->
+<!-- ``` -->
+
+
+```{r}
+make_subfigure_block <- function(folders, titles, plot_day, plot_type = "sim.large") {
+  files <- mapply(function(f, title) {
+    f_match <- list.files(
+      f, 
+      pattern = paste0("_t", plot_day, "_", plot_type), 
+      full.names = TRUE
+    )
+    if (length(f_match) == 0) return(NULL)
+    
+    paste0(
+      "\\begin{subfigure}[t]{0.31\\textwidth}\n",
+      "  \\includegraphics[width=\\linewidth]{", f_match[1], "}\n",
+      "  \\caption{", title, "}\n",
+      "\\end{subfigure}"
+    )
+  }, folders, titles, SIMPLIFY = FALSE)
+  
+  block <- paste(unlist(files), collapse = "\n")  # no blank lines in between!
+  
+  latex <- paste0(
+    "\\begin{figure}[ht]\n",
+    "  \\centering\n",
+    block, "\n",
+    "  \\caption{Posterior samples on ", plot_day, ".}\n",
+    "\\end{figure}\n"
+  )
+  
+  return(latex)
+}
+
+
+folders <- c(
+  "samples3/base/1_betnpow/fig", 
+  "samples3/eta/1_betnpow/fig", 
+  "samples3/regime/1_betnpow/fig"
+)
+
+titles <- c("Base model", "+ power ramp (PR)", "+ regime switch (RS)")
+plot_day <- "2013-11-02"
+```
+
+
+```{r, results='asis'}
+
+cat(make_subfigure_block(folders, titles, plot_day, "sim.large"))
+```
+
+
+
+<!-- ## Quantiles -->
+<!-- ```{r fig.cap="Quantiles from the model", fig.width=4.5, fig.height=2} -->
+<!-- # quantiles -->
+<!-- samples_fixed$plot.q+ -->
+<!--   theme(legend.position.inside = c(.15,.3)) -->
+<!-- ``` -->
+
+## Scoring
+
+Comparing NPB model vs. the Nonparametric density estimation method of Staid et. al.(2017).
+
+\small
+\begin{table}
+
+\caption{\label{tab:scoring}Model Scoring}
+\vspace{-0.5cm}
+\centering
+\begin{tabular}[t]{|l|r|r|r|r|r|}
+\hline
+Model & CRPS & Energy & \multicolumn{3}{c|}{Variogram} \\
+& & & $p = 0.5$ & $p = 1$ & $p = 2$ \\
+\hline
+NPB & 0.064 & 0.387 & 0.455 & 0.318 & 0.122\\
+\hline
+PR-NPB & 0.052 & 0.315 & 0.345 & 0.234 & 0.085\\
+\hline
+RS-PR-NPB & \textbf{0.045} & \textbf{0.274} & \textbf{0.313} & \textbf{0.208} & \textbf{0.081}\\
+\hline
+Nonparametric &  \textbf{0.045} & 0.288 & 0.368 & 0.226 & 0.086\\
+\hline
+\end{tabular}
+\end{table}
+
+## Power Ramp behaviour
+Method represents better the distribution of large ramp events, but it is not as smooth as the data in the low end.
+\small
+\begin{table}[hb]
+
+\caption{\label{tab:ramps}Percentage of hourly ramp events falling within threshold}
+\vspace{-0.5cm}
+\centering
+\begin{tabular}[t]{|l|ccccc|}
+\hline
+Model & \multicolumn{5}{c|}{Power ramp threshold} \\
+% \cline{2-6}
+      & $\leq$1\%  & $\leq$2\%  & $\leq$5\%  & $\leq$10\%  & $\leq$20\%  \\
+\hline
+Actuals & 36.1 & 51.6 & 76.7 & 93.2 & 99.3\\
+\hline
+RS-PR-NPB & 27.4 & 47.5 & \textbf{77.3} & \textbf{93.3} & \textbf{99.6}\\
+\hline
+Nonparametric & \textbf{37.5} & \textbf{54.2} & 83.5 & 98.1 & 99.9\\
+\hline
+\end{tabular}
+\end{table}
+
+## Conclusions
+
+- Method extends point estimates to probabilistic forecasts
+
+- Framework contemplates
+  - Capacity constraints
+  - Autoregressive properties
+  - Power ramp behaviour
+
+## Next steps
+- Spatial disaggregation
+- Extreme behaviour matching
+- Extension to solar energy
+
+##  
+
+\centering  
+\Huge Thanks!
+
+## References
+
+\footnotesize
+::: {#refs}
+:::
+
+
+# Appendix {#sec-appendix .unnumbered}
+
+## BPA capacity through time
+```{r fig.cap="Installed capacity through time", fig.width=4.5, fig.height=2}
+# setwd("../../p2_replication")
+capacity <- fread("capacity_time_series.csv")
+# capacity figure
+capacity %>%
+  ggplot(aes(x=date,y=capacity))+
+  geom_step(col=pal_lancet()(1),lwd=1)+
+  theme_bw()+ylab("BPA Capacity (MW)")
+```
+
+## Inference on model terms
+```{r fig.width= 7, fig.height=5, fig.cap="Estimated effects from the model", out.height="80%"}
+require(patchwork)  # For arranging multiple plots
+# mod.file.name <- "2501_us_power_ar2_v7.rds"
+# # read model
+# mod.path <- file.path("~/Documents/proj2/model_objects",mod.file.name)
+# mod.temp <- readRDS(mod.path)
+# Effects
+  effects.list <- names(mod.temp$summary.random) 
+  excluded <- c("t","eta","eta.1","eta.2")
+  
+effects_list <- lapply(
+    effects.list[!effects.list %in% excluded],
+    \(effect) plot.effects(mod.temp, effect, show.fig = FALSE)$fig)
+
+plot.a <- effects_list[[1]]+ labs(title = "Forecast regime effect", x = "Forecast group")
+plot.b <- effects_list[[2]]+ labs(title = "Wind speed effect", x = "wind speed group")
+plot.c <- effects_list[[3]]+ labs(title = "Month effect", x = "month")
+plot.d <- effects_list[[4]]+ labs(title = "Hour effect", x = "hour")
+
+# Arrange plots in a 2x2 grid
+(plot.a | plot.b) /
+(plot.c | plot.d)
+```
+## Posterior density of hyper parameters
+
+```{r fig.width=9, fig.height=5, fig.cap="Hyperparameters of the model", out.height="80%"}
+plot.hyper.dens(mod.temp,logx = FALSE, facet.cols = 4)
+```
+
